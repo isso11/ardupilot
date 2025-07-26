@@ -26,80 +26,114 @@ bool ModeGuided::_enter()
     plane.set_guided_WP(loc);
     return true;
 }
-
 void ModeGuided::update()
 {
 #if HAL_QUADPLANE_ENABLED
+    // If in VTOL loiter mode and quadplane is active, delegate update
     if (plane.auto_state.vtol_loiter && plane.quadplane.available()) {
         plane.quadplane.guided_update();
         return;
     }
 #endif
 
-    // Received an external msg that guides roll in the last 3 seconds?
-    if (plane.guided_state.last_forced_rpy_ms.x > 0 &&
-            millis() - plane.guided_state.last_forced_rpy_ms.x < 3000) {
-        plane.nav_roll_cd = constrain_int32(plane.guided_state.forced_rpy_cd.x, -plane.roll_limit_cd, plane.roll_limit_cd);
-        plane.update_load_factor();
+    // ------------------------------------------------------------------
+    // ROLL / YAW CONTROL (Prioritize forced roll, then heading tracking)
+    // ------------------------------------------------------------------
 
-#if AP_PLANE_OFFBOARD_GUIDED_SLEW_ENABLED
-    // guided_state.target_heading is radians at this point between -pi and pi ( defaults to -4 )
-    // This function is used in Guided and AvoidADSB, check for guided
-    } else if ((plane.control_mode == &plane.mode_guided) && (plane.guided_state.target_heading_type != GUIDED_HEADING_NONE) ) {
+    bool forced_roll_active = (plane.guided_state.last_forced_rpy_ms.x > 0 &&
+                               millis() - plane.guided_state.last_forced_rpy_ms.x < 3000);
+
+    bool heading_active = ((plane.control_mode == &plane.mode_guided) &&
+                           (plane.guided_state.target_heading_type != GUIDED_HEADING_NONE));
+
+    if (forced_roll_active) {
+        // Apply directly commanded roll angle from external source
+        plane.nav_roll_cd = constrain_int32(
+            plane.guided_state.forced_rpy_cd.x,
+            -plane.roll_limit_cd,
+            plane.roll_limit_cd
+        );
+
+    } else if (heading_active) {
+        // Compute roll demand from heading error using PID
         uint32_t tnow = AP_HAL::millis();
         float delta = (tnow - plane.guided_state.target_heading_time_ms) * 1e-3f;
         plane.guided_state.target_heading_time_ms = tnow;
 
         float error = 0.0f;
         if (plane.guided_state.target_heading_type == GUIDED_HEADING_HEADING) {
+            // Absolute heading control
             error = wrap_PI(plane.guided_state.target_heading - AP::ahrs().get_yaw_rad());
         } else {
+            // Course over ground tracking
             Vector2f groundspeed = AP::ahrs().groundspeed_vector();
-            error = wrap_PI(plane.guided_state.target_heading - atan2f(-groundspeed.y, -groundspeed.x) + M_PI);
+            error = wrap_PI(plane.guided_state.target_heading -
+                            atan2f(-groundspeed.y, -groundspeed.x) + M_PI);
         }
 
-        float bank_limit = degrees(atanf(plane.guided_state.target_heading_accel_limit/GRAVITY_MSS)) * 1e2f;
+        float bank_limit = degrees(atanf(
+            plane.guided_state.target_heading_accel_limit / GRAVITY_MSS)) * 1e2f;
         bank_limit = MIN(bank_limit, plane.roll_limit_cd);
 
-        // push error into AC_PID
-        const float desired = plane.g2.guidedHeading.update_error(error, delta, plane.guided_state.target_heading_limit);
+        const float desired = plane.g2.guidedHeading.update_error(
+            error, delta, plane.guided_state.target_heading_limit);
 
-        // Check for output saturation
+        // Set saturation flag for the controller
         plane.guided_state.target_heading_limit = fabsf(desired) >= bank_limit;
 
         plane.nav_roll_cd = constrain_int32(desired, -bank_limit, bank_limit);
-        plane.update_load_factor();
 
-#endif // AP_PLANE_OFFBOARD_GUIDED_SLEW_ENABLED
     } else {
+        // Default roll navigation
         plane.calc_nav_roll();
     }
 
+    // Update G-load based on nav_roll_cd
+    plane.update_load_factor();
+
+    // ------------------------------------------------------------------
+    // PITCH CONTROL (Independent of heading/roll)
+    // ------------------------------------------------------------------
+
     if (plane.guided_state.last_forced_rpy_ms.y > 0 &&
-            millis() - plane.guided_state.last_forced_rpy_ms.y < 3000) {
-        plane.nav_pitch_cd = constrain_int32(plane.guided_state.forced_rpy_cd.y, plane.pitch_limit_min*100, plane.aparm.pitch_limit_max.get()*100);
+        millis() - plane.guided_state.last_forced_rpy_ms.y < 3000) {
+        // Apply externally commanded pitch
+        plane.nav_pitch_cd = constrain_int32(
+            plane.guided_state.forced_rpy_cd.y,
+            plane.pitch_limit_min * 100,
+            plane.aparm.pitch_limit_max.get() * 100
+        );
     } else {
+        // Default pitch navigation
         plane.calc_nav_pitch();
     }
 
-    // Throttle output
-    if (plane.guided_throttle_passthru) {
-        // manual passthrough of throttle in fence breach
-        SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, plane.get_throttle_input(true));
+    // ------------------------------------------------------------------
+    // THROTTLE CONTROL
+    // ------------------------------------------------------------------
 
-    }  else if (plane.aparm.throttle_cruise > 1 &&
-            plane.guided_state.last_forced_throttle_ms > 0 &&
-            millis() - plane.guided_state.last_forced_throttle_ms < 3000) {
-        // Received an external msg that guides throttle in the last 3 seconds?
-        SRV_Channels::set_output_scaled(SRV_Channel::k_throttle, plane.guided_state.forced_throttle);
+    if (plane.guided_throttle_passthru) {
+        // Manual passthrough of throttle (e.g., during fence breach)
+        SRV_Channels::set_output_scaled(
+            SRV_Channel::k_throttle,
+            plane.get_throttle_input(true)
+        );
+
+    } else if (plane.aparm.throttle_cruise > 1 &&
+               plane.guided_state.last_forced_throttle_ms > 0 &&
+               millis() - plane.guided_state.last_forced_throttle_ms < 3000) {
+        // Apply externally commanded throttle
+        SRV_Channels::set_output_scaled(
+            SRV_Channel::k_throttle,
+            plane.guided_state.forced_throttle
+        );
 
     } else {
-        // TECS control
+        // Use TECS for closed-loop throttle control
         plane.calc_throttle();
-
     }
-
 }
+
 
 void ModeGuided::navigate()
 {
